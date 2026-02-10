@@ -148,7 +148,19 @@ def main(args):
         'frame_index': frame_index_arr[idx],
         'depth_uncertainty': depth_unc_arr[idx],
     }) 
-    # tsdf_pc.to_csv(args.out_dir + "/point_cloud_tsdf.csv", index=False)
+    tsdf_pc.to_csv(args.out_dir + "/point_cloud_tsdf.csv", index=False)
+
+    # Save PLY point clouds (RGB-colored and semantic-colored)
+    pc_rgb = o3d.geometry.PointCloud()
+    pc_rgb.points = o3d.utility.Vector3dVector(tsdf_xyz)
+    pc_rgb.colors = o3d.utility.Vector3dVector(tsdf_rgb.astype(np.float64) / 255.0)
+    o3d.io.write_point_cloud(args.out_dir + "/point_cloud_rgb.ply", pc_rgb)
+
+    pc_seg = o3d.geometry.PointCloud()
+    pc_seg.points = o3d.utility.Vector3dVector(tsdf_xyz)
+    pc_seg.colors = o3d.utility.Vector3dVector(rgb_seg_arr.astype(np.float64) / 255.0)
+    o3d.io.write_point_cloud(args.out_dir + "/point_cloud_semantic.ply", pc_seg)
+
     print("Saved TSDF Point Cloud in ", time() - t, "seconds")
 
 

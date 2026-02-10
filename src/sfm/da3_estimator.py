@@ -50,21 +50,24 @@ class DA3Estimator(DepthPoseEstimator):
     ) -> EstimatorOutput:
         """Run DA3-Streaming and return globally-aligned depth/poses."""
 
-        # Create temporary directory for frames and output
+        # Create temporary directory for frames and output.
+        # Clean any stale data from previous runs to avoid mixing results.
         tmp_dir = Path(args.tmp_dir) / "da3_streaming"
         frames_dir = tmp_dir / "frames"
         output_dir = tmp_dir / "output"
+        if frames_dir.exists():
+            shutil.rmtree(frames_dir)
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
         frames_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Symlink or copy frames to frames_dir (DA3_Streaming expects a directory)
+        # Resize and copy frames to frames_dir (DA3_Streaming expects a directory)
         print(f"Preparing {len(img_list)} frames for DA3-Streaming...")
         for i, img_path in enumerate(tqdm(img_list, desc="Linking frames")):
             dst = frames_dir / f"{i:07d}.jpg"
-            if not dst.exists():
-                # Resize to target dimensions and save
-                img = Image.open(img_path).resize((width, height), Image.BILINEAR)
-                img.save(dst, quality=95)
+            img = Image.open(img_path).resize((width, height), Image.BILINEAR)
+            img.save(dst, quality=95)
 
         # Run DA3-Streaming
         self._run_streaming(frames_dir, output_dir)

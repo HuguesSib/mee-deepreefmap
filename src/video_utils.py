@@ -26,7 +26,12 @@ def extract_frames_and_gopro_gravity_vector(video_names, timestamps, width, heig
     and in reverse for videos where the camera moves backwards.
     """
 
-    os.makedirs(tmp_dir + "/rgb", exist_ok=True)
+    # Clean any stale frames from previous runs to avoid mixing data
+    rgb_dir = tmp_dir + "/rgb"
+    if os.path.exists(rgb_dir):
+        import shutil
+        shutil.rmtree(rgb_dir)
+    os.makedirs(rgb_dir, exist_ok=True)
     
     gravity_vectors = []
     total_frames = 0
@@ -101,7 +106,12 @@ def render_video(img_list, depths, semantic_segmentation, results_npy, fps, clas
     and may have minor misalignment at extreme edges, but the overall visualization
     is much better than showing rectified images with black borders.
     """
-    os.makedirs(tmp_dir + "/render", exist_ok=True)
+    # Clean any stale rendered frames from previous runs
+    render_dir = tmp_dir + "/render"
+    if os.path.exists(render_dir):
+        import shutil
+        shutil.rmtree(render_dir)
+    os.makedirs(render_dir, exist_ok=True)
 
     # Normalize depths to [0, 1] for visualization using percentile clipping.
     valid_depths = depths[depths > 1e-3]
