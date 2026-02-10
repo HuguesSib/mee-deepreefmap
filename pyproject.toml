@@ -7,12 +7,19 @@ requires-python = ">=3.10, <3.12"
 authors = ["Jonathan Sauder <josaudergh@gmail.com>"]
 dependencies = [
     "addict==2.4.0",
+    "depth-anything-3",
+    "einops>=0.8.2",
+    "faiss-cpu>=1.13.2",
     "h5py==3.7.0",
     "matplotlib==3.5.3",
+    "numba>=0.63.1",
     "numpy==1.26.4",
     "open3d==0.16.0",
     "pandas==1.4.4",
     "pillow==9.1",
+    "pypose>=0.7.5",
+    "pyyaml>=6.0.2",
+    "safetensors>=0.4.5",
     "scikit-image==0.24.0",
     "scikit-learn==1.5.2",
     "scipy==1.14.1",
@@ -23,3 +30,10 @@ dependencies = [
     "tqdm==4.64.1",
     "wandb==0.13.7",
 ]
+
+[tool.uv.sources]
+depth-anything-3 = { git = "https://github.com/ByteDance-Seed/Depth-Anything-3" }
+
+# NOTE: Depth Anything 3 (--depth_model=da3) requires additional dependencies:
+#   pip install depth-anything-3 safetensors einops numba pyyaml
+# The DA3 module is included in src/da3_streaming/ with pre-trained weights.

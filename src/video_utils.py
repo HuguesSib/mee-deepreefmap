@@ -1,10 +1,13 @@
 import subprocess
-import numpy as np 
+
+import numpy as np
 import os
 from gpmfstream import Stream
 from tqdm import tqdm
 from PIL import Image
 from skimage.transform import resize
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend to avoid segfaults
 import matplotlib.pyplot as plt
 from reconstruction_utils import get_legend
 
@@ -90,18 +93,28 @@ def get_gravity_vectors(video, timestamp, number_of_frames):
     grav /= np.linalg.norm(grav, axis=1).reshape(-1, 1)
     return grav
 
-def render_video(img_list, depths, semantic_segmentation, results_npy, fps, class_to_label, label_to_color, tmp_dir, reverse):
-    """Renders a video from the given images, depths, semantic_segmentation and 2d maps."""
+def render_video(img_list, depths, semantic_segmentation, results_npy, fps, class_to_label, label_to_color, tmp_dir, reverse, camera_type="eucm", intrinsics_file=None):
+    """Renders a video from the given images, depths, semantic_segmentation and 2d maps.
+
+    Note: For visualization the original fisheye frames are always used.
+    When *camera_type* is ``"pinhole"`` (DA3), depth maps are in rectified space
+    and may have minor misalignment at extreme edges, but the overall visualization
+    is much better than showing rectified images with black borders.
+    """
     os.makedirs(tmp_dir + "/render", exist_ok=True)
-    
-    # For visualization, its nicer when depths are scaled between 0 and 1, and sqrt_scaled
-    q2, q98 = np.nanquantile(depths, [0.02, 0.98])
-    depths = np.nan_to_num(depths, nan=q2)
-    depths = np.clip(depths, q2, q98)
-    depths = np.clip(depths, q2, 0.35)
-    depths_ = np.sqrt(depths)
-    depths_ = (depths_ - np.min(depths_)/2) / (np.max(depths_)-np.min(depths_)/2)
-    #depths_ = depths_ / np.max(depths_)
+
+    # Normalize depths to [0, 1] for visualization using percentile clipping.
+    valid_depths = depths[depths > 1e-3]
+    if len(valid_depths) > 0:
+        dmin, dmax = np.nanpercentile(valid_depths, [2, 98])
+    else:
+        dmin, dmax = 0.0, 1.0
+    depths = np.nan_to_num(depths, nan=dmin)
+    depths = np.clip(depths, dmin, dmax)
+    if dmax - dmin > 1e-6:
+        depths_ = (depths - dmin) / (dmax - dmin)
+    else:
+        depths_ = np.zeros_like(depths)
 
 
     class_to_color = {class_name: label_to_color[class_label] for class_name, class_label in class_to_label.items()}
@@ -144,8 +157,8 @@ def render_video(img_list, depths, semantic_segmentation, results_npy, fps, clas
         resize_ratio = results_npy_rgb.shape[1]/rgb.shape[1]
         results_npy_rgb = resize(results_npy_rgb, (round(results_npy_rgb.shape[0]/resize_ratio), round(results_npy_rgb.shape[1]/resize_ratio)))
         image = np.concatenate([
-            np.concatenate([rgb, 0.2 * rgb + 0.8 * plt.cm.seismic(depths_[i])[:,:,:3]], axis=0),
-            np.concatenate([0.3 * rgb + 0.7 * color_semseg.astype(np.float32)/255., 
+            np.concatenate([rgb, 0.2 * rgb + 0.8 * plt.cm.inferno(depths_[i])[:,:,:3]], axis=0),
+            np.concatenate([0.3 * rgb + 0.7 * color_semseg.astype(np.float32)/255.,
                             results_npy_rgb], axis=0),
         ], axis=1)
         if reverse:

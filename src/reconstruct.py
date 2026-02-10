@@ -1,30 +1,32 @@
 import argparse
+import json
 import os
+from time import time
+
+import h5py
 import numpy as np
+import open3d as o3d
+import pandas as pd
 import torch
 import torchvision
-import torchvision.transforms.functional as F
 from PIL import Image
-import pandas as pd
-import torch.nn as nn
-from time import time 
-import segmentation_models_pytorch as smp
-import segmentation
-from sfm.model import SfMModel
-from segmentation.model import SegmentationModel
-from video_utils import extract_frames_and_gopro_gravity_vector, render_video
-from tqdm import tqdm
-import h5py
-import open3d as o3d
 from sklearn.decomposition import PCA
-from reconstruction_utils import get_closest_to_centroid_with_attributes_of_closest_to_cam, map_3d, get_matching_indices, get_rotation_matrix_to_align_pose_with_gravity, get_edgeness, aggregate_2d_grid
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-from sfm.inverse_warp import EUCMCamera, Pose, pose_vec2mat, rectify_eucm
-import scipy
-import json
+from tqdm import tqdm
 
-import sys
-sys.path.append('/home/jonathan/mee-deepreefmap/src/ffmpeg-7.0.2-amd64-static/ffmpeg')
+import segmentation
+from segmentation.model import SegmentationModel
+from sfm.estimator import DepthPoseEstimator
+from sfm.inverse_warp import EUCMCamera, Pose, rectify_eucm
+from reconstruction_utils import (
+    get_closest_to_centroid_with_attributes_of_closest_to_cam,
+    map_3d,
+    get_matching_indices,
+    get_edgeness,
+    aggregate_2d_grid,
+)
+from video_utils import extract_frames_and_gopro_gravity_vector, render_video
+
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 # Start by parsing args
 parser = argparse.ArgumentParser(description='Reconstruct a 3D model from a video')
@@ -52,6 +54,21 @@ parser.add_argument('--class_to_color_file', type=str, default="../example_input
 parser.add_argument('--output_2d_grid_size', type=int, default=2000, help='Size of the 2D grid used for benthic cover analysis - a higher grid size will produce higher resolution outputs but takes longer to compute and may have empty grid cells')
 parser.add_argument('--buffer_size', type=int, default=2, help='Number of frames to use for temporal smoothing')
 parser.add_argument('--render_video', action='store_true', help='Whether to render output 4-panel video')
+# Depth/pose estimator selection
+parser.add_argument('--depth_model', type=str, default='legacy', choices=['legacy', 'da3'],
+                    help='Depth/pose estimation backend: "legacy" for original SfMModel, "da3" for Depth Anything 3')
+parser.add_argument('--da3_model', type=str, default='depth-anything/DA3-LARGE-1.1',
+                    help='HuggingFace model (DA3-SMALL/BASE/LARGE/GIANT)')
+parser.add_argument('--da3_chunk_size', type=int, default=120,
+                    help='Frames per chunk for DA3-Streaming')
+parser.add_argument('--da3_overlap', type=int, default=60,
+                    help='Overlap between chunks for alignment')
+parser.add_argument('--da3_loop_enable', action='store_true', default=True,
+                    help='Enable loop closure detection')
+parser.add_argument('--da3_streaming_root', type=str, default=None,
+                    help='Path to DA3-Streaming root (default: src/da3_streaming)')
+parser.add_argument('--conf_threshold', type=float, default=0.4,
+                    help='Minimum depth confidence (0.4 recommended for DA3)')
 args = parser.parse_args()
 
 def main(args):
@@ -83,9 +100,9 @@ def main(args):
     img_list = [args.tmp_dir + "/rgb/" +file for file in sorted(os.listdir(args.tmp_dir + "/rgb")) if "jpg" in file]
     print("Running Neural Networks ...")
     
-    depths, depth_uncertainties, poses, semantic_segmentation, intrinsics = get_nn_predictions(
-        img_list, 
-        grav, 
+    depths, depth_uncertainties, depth_confidences, poses, semantic_segmentation, intrinsics, camera_type = get_nn_predictions(
+        img_list,
+        grav,
         len(class_to_label) + 1,
         h5f,
         args,
@@ -95,20 +112,22 @@ def main(args):
     print("Building Point Cloud ...")
     os.makedirs(args.out_dir + "/videos", exist_ok=True)
     xyz_index_arr, distance2cam_arr, seg_arr, frame_index_arr, depth_unc_arr, keep_masks, dist_cutoffs = get_point_cloud(
-        img_list, 
-        depths, 
-        poses, 
-        depth_uncertainties, 
-        semantic_segmentation, 
+        img_list,
+        depths,
+        poses,
+        depth_uncertainties,
+        semantic_segmentation,
         intrinsics,
-        label_to_color, 
+        label_to_color,
         class_to_label,
         h5f,
-        args
+        args,
+        camera_type=camera_type,
+        depth_confidences=depth_confidences,
     )
 
     print("Integrating TSDF!")
-    tsdf_xyz, tsdf_rgb = tsdf_point_cloud(img_list, depths, keep_masks, poses, intrinsics, np.mean(depths), args.frames_per_volume, args.tsdf_overlap, dist_cutoffs)
+    tsdf_xyz, tsdf_rgb = tsdf_point_cloud(img_list, depths, keep_masks, poses, intrinsics, np.mean(depths), args.frames_per_volume, args.tsdf_overlap, dist_cutoffs, camera_type=camera_type)
     print("Integrated TSDF Point Cloud in ", time() - t, "seconds")
 
     idx = get_matching_indices(tsdf_xyz, xyz_index_arr)
@@ -129,7 +148,7 @@ def main(args):
         'frame_index': frame_index_arr[idx],
         'depth_uncertainty': depth_unc_arr[idx],
     }) 
-    tsdf_pc.to_csv(args.out_dir + "/point_cloud_tsdf.csv", index=False)
+    # tsdf_pc.to_csv(args.out_dir + "/point_cloud_tsdf.csv", index=False)
     print("Saved TSDF Point Cloud in ", time() - t, "seconds")
 
 
@@ -142,22 +161,10 @@ def main(args):
     os.system("cp "+args.class_to_color_file+" "+ args.out_dir)
     if args.render_video:
         os.system("cp "+args.tmp_dir+"/*_.mp4 "+ args.out_dir + "/videos")
-        render_video(img_list, depths, semantic_segmentation, results, args.fps, class_to_label, label_to_color, args.tmp_dir, args.reverse)
+        render_video(img_list, depths, semantic_segmentation, results, args.fps, class_to_label, label_to_color, args.tmp_dir, args.reverse, camera_type=camera_type, intrinsics_file=args.intrinsics_file)
         os.system("mv " + args.tmp_dir + "/out.mp4 " + args.out_dir + "/videos")
         print("Rendered Video in ", time() - t, "seconds")
     return 
-
-
-def reset_batchnorm_layers(model):
-    for module in model.modules():
-        if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-            module.eps = 1e-4
-
-
-def change_bn_momentum(model, new_value):
-    for name, module in model.named_modules():
-        if isinstance(module, nn.BatchNorm2d):
-            module.momentum = new_value
 
 
 def expand_zeros(mask):
@@ -175,139 +182,155 @@ def expand_zeros(mask):
 
     return result_mask
 
-def get_nn_predictions(img_list, grav, num_classes, h5f, args):
-    totensor = torchvision.transforms.ToTensor()
-    normalize = torchvision.transforms.Normalize(mean=[0.45, 0.45, 0.45],
-                                                std=[0.225, 0.225, 0.225])
-    sfm_model = SfMModel().to(device)
-    sfm_model.load_state_dict(torch.load(args.sfm_checkpoint, map_location=device))
-    change_bn_momentum(sfm_model, 0.01)
-    reset_batchnorm_layers(sfm_model)
-    sfm_model.eval()
 
+def create_estimator(args) -> DepthPoseEstimator:
+    """Instantiate the selected depth/pose estimation backend."""
+    if args.depth_model == "legacy":
+        from sfm.legacy_estimator import LegacySfMEstimator
+        estimator = LegacySfMEstimator()
+    elif args.depth_model == "da3":
+        from sfm.da3_estimator import DA3Estimator
+        estimator = DA3Estimator()
+    else:
+        raise ValueError(f"Unknown depth model: {args.depth_model}")
+    estimator.setup(str(device), args)
+    return estimator
+
+
+def get_nn_predictions(img_list, grav, num_classes, h5f, args):
+    """Run depth/pose estimation and semantic segmentation on extracted frames.
+
+    Depth/pose prediction is delegated to the selected estimator backend.
+    Segmentation still runs inline (it is independent of the depth model).
+    """
+    totensor = torchvision.transforms.ToTensor()
+    normalize = torchvision.transforms.Normalize(
+        mean=[0.45, 0.45, 0.45], std=[0.225, 0.225, 0.225]
+    )
+
+    # --- Depth / pose estimation via the selected backend ---
+    estimator = create_estimator(args)
+    est_output = estimator.predict(img_list, grav, args.height, args.width, args)
+
+    depths = est_output.depths                  # [N, H, W] float32
+    depth_uncertainties = est_output.depth_uncertainties  # [N, H, W] or None
+    depth_confidences = est_output.depth_confidences      # [N, H, W] or None
+    poses = est_output.poses                    # [N, 4, 4] float32
+    intrinsics_predicted = est_output.intrinsics  # [N, K] float32
+    camera_type = est_output.camera_type
+
+    # Log depth statistics so users can calibrate --distance_thresh
+    depth_median = float(np.median(depths[depths > 0]))
+    depth_q95 = float(np.quantile(depths[depths > 0], 0.95))
+    print(f"Depth stats: median={depth_median:.3f}m, 95th-pct={depth_q95:.3f}m")
+
+    # Auto-adjust distance_thresh if the user left the default and it's clearly
+    # too small for the actual depth range (e.g., DA3 metric depth in real metres).
+    if args.distance_thresh == 0.2 and depth_median > 0.5:
+        old_thresh = args.distance_thresh
+        args.distance_thresh = float(np.quantile(depths[depths > 0], 0.90))
+        print(
+            f"Auto-adjusted --distance_thresh from {old_thresh} to "
+            f"{args.distance_thresh:.3f} (90th-pct of depth) to match depth scale"
+        )
+
+    # Store depths/uncertainties in HDF5 for downstream consumers
+    h5f.create_dataset("depths", data=depths)
+    if depth_uncertainties is None:
+        depth_uncertainties = np.zeros_like(depths)
+    h5f.create_dataset("depth_uncertainties", data=depth_uncertainties)
+    h5f.create_dataset("intrinsics", data=intrinsics_predicted)
+
+    # --- Semantic segmentation (unchanged -- runs independently) ---
     segmentation_model = SegmentationModel(num_classes).to(device)
-    segmentation_model.load_state_dict(torch.load(args.segmentation_checkpoint, map_location=device))
+    segmentation_model.load_state_dict(
+        torch.load(args.segmentation_checkpoint, map_location=device)
+    )
     segmentation_model.eval()
-    
-    intrinsics = torch.tensor(list(json.load(open(args.intrinsics_file)).values())).float().to(device).unsqueeze(0)
+
+    semantic_segmentation = h5f.create_dataset(
+        "semantic_segmentation", (len(img_list), args.height, args.width), dtype="u1"
+    )
 
     buffer_size = args.buffer_size
-    # Start by initializing, load the images in a buffer of buffer_size subsequent frames
-    images = [normalize(totensor(Image.open(img_list[i]))).to(device).unsqueeze(0) for i in range(buffer_size-1)]
-    
-    counts = np.zeros(len(img_list), dtype=np.uint8)
-    depths_buffered = h5f.create_dataset("depths_buffered", (args.buffer_size, len(img_list), args.height, args.width), dtype='f4')
-    depths = h5f.create_dataset("depths", (len(img_list), args.height,  args.width), dtype='f4')
-    depth_uncertainties = h5f.create_dataset("depth_uncertainties", (len(img_list), args.height,  args.width), dtype='f4')
-    semantic_segmentation = h5f.create_dataset("semantic_segmentation", (len(img_list), args.height,  args.width), dtype='u1')
-    intrinsics_predicted_buffered = h5f.create_dataset("intrinsics_buffered", (args.buffer_size, len(img_list), 6), dtype='f4')
-    intrinsics_predicted = h5f.create_dataset("intrinsics", (len(img_list), 6), dtype='f4')
-    poses = {}
+    semseg_buffer = torch.zeros(
+        (3, num_classes, args.height, args.width), requires_grad=False
+    ).to(device)
+    wtens = (
+        torch.tensor([1.0, 2.0, 1.0], requires_grad=False)
+        .to(device)
+        .unsqueeze(1)
+        .unsqueeze(1)
+        .unsqueeze(1)
+    )
 
-    semseg_buffer = torch.zeros((3, num_classes, args.height, args.width), requires_grad=False).to(device)
-    wtens = torch.tensor([1.0, 2.0, 1.0], requires_grad=False).to(device).unsqueeze(1).unsqueeze(1).unsqueeze(1)
+    # Seed segmentation buffer
+    images = [
+        normalize(totensor(Image.open(img_list[i]))).to(device).unsqueeze(0)
+        for i in range(buffer_size - 1)
+    ]
     with torch.no_grad():
         semseg_logits = []
-        for i in range(buffer_size-1):
-            semseg_logits.append(segmentation.model.predict(segmentation_model, images[i], num_classes, args.height, args.width))
-
-        
-        for i in range(buffer_size-2):
-            semantic_segmentation[i] = torch.stack(semseg_logits[max(0,i-1):i+1]).mean(dim=0).argmax(dim=0).cpu().numpy()
-        
-        if len(semseg_logits)==1:
+        for i in range(buffer_size - 1):
+            semseg_logits.append(
+                segmentation.model.predict(
+                    segmentation_model, images[i], num_classes, args.height, args.width
+                )
+            )
+        for i in range(buffer_size - 2):
+            semantic_segmentation[i] = (
+                torch.stack(semseg_logits[max(0, i - 1): i + 1])
+                .mean(dim=0)
+                .argmax(dim=0)
+                .cpu()
+                .numpy()
+            )
+        if len(semseg_logits) == 1:
             semseg_logits.append(semseg_logits[-1])
         semseg_buffer[0] = semseg_logits[-2]
         semseg_buffer[1] = semseg_logits[-1]
         del semseg_logits
-    images = [F.resize(x, (args.height, args.width)) for x in images]
-    depth_features = [[f.detach() for f in sfm_model.extract_features(x)] for x in images]
-    
 
-    for end_index in tqdm(range(buffer_size-1, len(img_list))):
-        new_im = normalize(totensor(Image.open(img_list[end_index]))).to(device).unsqueeze(0)
-
-        
-        with torch.no_grad():
-            semseg_buffer[2] = segmentation.model.predict(segmentation_model, new_im, num_classes, args.height, args.width)
-            semantic_segmentation[end_index-1] = (semseg_buffer*wtens).mean(dim=0).argmax(dim=0).cpu().numpy()
+    # Sliding window for segmentation
+    with torch.no_grad():
+        for end_index in tqdm(range(buffer_size - 1, len(img_list)), desc="Seg"):
+            new_im = normalize(totensor(Image.open(img_list[end_index]))).to(device).unsqueeze(0)
+            semseg_buffer[2] = segmentation.model.predict(
+                segmentation_model, new_im, num_classes, args.height, args.width
+            )
+            semantic_segmentation[end_index - 1] = (
+                (semseg_buffer * wtens).mean(dim=0).argmax(dim=0).cpu().numpy()
+            )
             semseg_buffer[:2] = semseg_buffer[1:].clone()
 
-        images.append(F.resize(new_im, (args.height,  args.width)))
+    semantic_segmentation[-1] = (
+        (semseg_buffer * wtens).mean(dim=0).argmax(dim=0).cpu().numpy()
+    )
 
-        with torch.no_grad():
-            depth_features.append([f.detach() for f in sfm_model.extract_features(images[-1])])
-
-        depth, pose, intrinsics_updated =  sfm_model.get_depth_and_poses_from_features(images, depth_features, intrinsics)
-        for i in range(buffer_size):
-            idx = end_index - buffer_size + i + 1
-            count = counts[idx]
-            depths_buffered[count, idx] = depth[i].squeeze().detach().cpu().numpy()
-            intrinsics_predicted_buffered[count, idx] = intrinsics_updated[i].detach().cpu().numpy()
-            counts[idx]+=1
-            for j in range(buffer_size):
-                jdx = end_index - buffer_size + j + 1
-                if pose[i][j] != []:
-                    if idx not in poses:
-                        poses[idx] = {}
-                    if jdx not in poses[idx]:
-                        poses[idx][jdx] = []
-                    poses[idx][jdx].append(pose[i][j].detach().unsqueeze(0).cpu().numpy())
+    return depths, depth_uncertainties, depth_confidences, poses, semantic_segmentation, intrinsics_predicted, camera_type
 
 
-        images.pop(0)
-        depth_features.pop(0)
-    
-    for i in tqdm(range(len(img_list))):
-        depths[i] = np.mean(depths_buffered[:counts[i],i],axis=0)
-    for i in tqdm(range(len(img_list))):
-        depth_uncertainties[i] = np.std(depths_buffered[:counts[i],i],axis=0)
-    for i in tqdm(range(len(img_list))):
-        intrinsics_predicted[i] = np.median(intrinsics_predicted_buffered[:counts[i],i],axis=0)
-        
-    l = len(img_list)
+def _unproject_depth_pinhole(depth_map, fx, fy, cx, cy):
+    """Unproject a depth map to 3D points using a pinhole camera model.
 
-    semantic_segmentation[-1] = (semseg_buffer * wtens).mean(dim=0).argmax(dim=0).cpu().numpy()
-    
-    poses = [(torch.tensor(np.median(poses[i+1][i],axis=0) - np.median(poses[i][i+1],axis=0))/2) for i in range(len(poses)-1)]
-    poses = [pose_vec2mat(p).squeeze().cpu().numpy() for p in poses]
-    poses = [np.vstack([p, np.array([0, 0, 0, 1]).reshape(1, 4)]) for p in poses]
+    Parameters
+    ----------
+    depth_map : np.ndarray [H, W]
+    fx, fy, cx, cy : float
 
-    poses = np.array(poses)
-    med_rot = np.median(poses[:,:3,:3]-np.eye(3), axis=0)
-    poses[:,:3,:3] -= med_rot 
-    
-    grav_buffer = 100
-    if grav is not None:
-        pose0 = np.eye(4)
-        new_cum_poses = np.zeros((len(poses)+1,4,4))
+    Returns
+    -------
+    coords : torch.Tensor [3, H*W] on CPU
+    """
+    h, w = depth_map.shape
+    u, v = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    z = depth_map
+    x = (u - cx) * z / fx
+    y = (v - cy) * z / fy
+    return torch.from_numpy(np.stack([x, y, z], axis=0).reshape(3, -1))
 
 
-        grav0 = np.mean(grav[:grav_buffer],axis=0)
-
-        correction = get_rotation_matrix_to_align_pose_with_gravity(pose0, grav0)
-        pose0[:3,:3] = correction @ pose0[:3,:3] 
-        new_cum_poses[0] = pose0.copy()
-
-        for i, (pose, g_) in enumerate(zip(poses,grav[1:])):
-
-            g = np.mean(grav[max(0, 1 + i - grav_buffer):min(i + grav_buffer, len(grav-1))], axis=0)
-            pose0 = pose0 @ pose
-            correction = get_rotation_matrix_to_align_pose_with_gravity(pose0, g)
-            pose0[:3,:3] = correction @ pose0[:3,:3] 
-            new_cum_poses[i+1] = pose0.copy()
-        poses = np.array(new_cum_poses)
-    else:
-        new_cum_poses = np.zeros((len(poses)+1,4,4))
-        new_cum_poses[0] = np.eye(4)
-        for i in range(len(poses)):
-            new_cum_poses[i+1] = new_cum_poses[i] @ poses[i]
-        poses = np.array(new_cum_poses)
-
-    return depths, depth_uncertainties, poses, semantic_segmentation, intrinsics_predicted
-
-
-def get_point_cloud(image_list, depths, poses, depth_uncertainties, semantic_segmentation, intrinsics, label_to_color, class_to_label, h5f, args):
+def get_point_cloud(image_list, depths, poses, depth_uncertainties, semantic_segmentation, intrinsics, label_to_color, class_to_label, h5f, args, camera_type="eucm", depth_confidences=None):
     ignore_classes = args.ignore_classes_in_point_cloud.split(",")
 
     def class_to_color(class_arr):
@@ -316,8 +339,7 @@ def get_point_cloud(image_list, depths, poses, depth_uncertainties, semantic_seg
             color_arr[class_arr==val] = label_to_color[val]
         return color_arr
     dist_cutoffs = []
-    with torch.no_grad(): 
-        
+    with torch.no_grad():
 
         xyz_arr = h5f.create_dataset("xyz_arr", (len(image_list)*args.number_of_points_per_image, 3), dtype='f4')
         distance2cam_arr = h5f.create_dataset("distance2cam_arr", (len(image_list)*args.number_of_points_per_image), dtype='f4')
@@ -330,30 +352,43 @@ def get_point_cloud(image_list, depths, poses, depth_uncertainties, semantic_seg
 
         for i in tqdm(range(len(poses))):
 
-            pose =  torch.tensor((poses[i])[:3]).float().to(device)
-
-
-            cam = EUCMCamera(torch.tensor(intrinsics[i]).unsqueeze(0).to(device), Tcw=Pose(T=1))
+            pose = torch.tensor((poses[i])[:3]).float().to(device)
             depth_i_tensor = torch.tensor(depths[i]).to(device)
-            coords = cam.reconstruct_depth_map(depth_i_tensor.unsqueeze(0).unsqueeze(0).to(device)).squeeze()
-            coords = coords.reshape(3, -1)
-            coords = (pose @ torch.cat([coords, torch.ones_like(coords[:1])], dim=0).reshape(4,-1)).T.cpu()
 
+            # --- Unproject depth to 3D using the appropriate camera model ---
+            if camera_type == "eucm":
+                cam = EUCMCamera(torch.tensor(intrinsics[i]).unsqueeze(0).to(device), Tcw=Pose(T=1))
+                coords = cam.reconstruct_depth_map(depth_i_tensor.unsqueeze(0).unsqueeze(0).to(device)).squeeze()
+                coords = coords.reshape(3, -1)
+            else:  # pinhole
+                fx, fy, cx, cy = intrinsics[i][:4]
+                coords = _unproject_depth_pinhole(depths[i], fx, fy, cx, cy).to(device)
+
+            # Transform to world coordinates
+            coords = (pose @ torch.cat([coords, torch.ones_like(coords[:1])], dim=0).reshape(4, -1)).T.cpu()
 
             dist_cutoffs.append(args.distance_thresh)
             keep_mask = depth_i_tensor.squeeze() < args.distance_thresh
             seg = torch.tensor(semantic_segmentation[i]).to(device)
 
-            #Exclude points on the 'edge' of objects, i.e. where the countours depth map varies a lot
-            # TODO Magic Numbers
+            # Filter by depth confidence (e.g. from DA3)
+            if depth_confidences is not None and args.conf_threshold > 0:
+                conf_i = torch.tensor(depth_confidences[i]).to(device)
+                keep_mask = torch.logical_and(keep_mask, conf_i > args.conf_threshold)
+
+            # Exclude points on the 'edge' of objects (high depth gradient)
             keep_mask = torch.logical_and(get_edgeness(depth_i_tensor) < 0.04, keep_mask)
-            keep_mask[30:170,30:-30] = 0
+
+            # Mask out fisheye border region (only for legacy EUCM, not DA3 pinhole)
+            if camera_type == "eucm":
+                keep_mask[30:170, 30:-30] = 0
+
             for class_name in ignore_classes:
                 keep_mask = torch.logical_and(seg != class_to_label[class_name], keep_mask)
             keep_mask = expand_zeros(keep_mask)
             keep_mask = keep_mask.cpu().numpy()
             keep_masks[i] = keep_mask.astype(np.uint8)
-            keep_mask = keep_mask.reshape(-1)            
+            keep_mask = keep_mask.reshape(-1)
             valid_points = keep_mask.sum().item()
             random_selection = np.random.permutation(valid_points)[:args.number_of_points_per_image]
             offset = min(valid_points, args.number_of_points_per_image)
@@ -361,98 +396,149 @@ def get_point_cloud(image_list, depths, poses, depth_uncertainties, semantic_seg
             xyz_arr[cursor:cursor+offset]=coords[keep_mask][random_selection]
             distance2cam_arr[cursor:cursor+offset]=  depths[i].reshape(-1)[keep_mask][random_selection]
 
-
             seg_arr[cursor:cursor+offset] = semantic_segmentation[i].reshape(-1).astype(np.uint8)[keep_mask][random_selection]
             dunc = depth_uncertainties[i].reshape(-1)[keep_mask][random_selection]
             depth_unc_arr[cursor:cursor+offset]=dunc
             frame_index_arr[cursor:cursor+offset]= np.zeros_like(dunc, dtype=np.uint16)+i
 
             cursor += offset
-        
 
 
-        print("Filtering redundant points")
+        if cursor == 0:
+            raise RuntimeError(
+                f"No valid points survived filtering (distance_thresh={args.distance_thresh:.3f}m). "
+                f"This usually means --distance_thresh is too small for the depth model's output scale. "
+                f"Try increasing it, e.g. --distance_thresh=3.0"
+            )
+
+        print(f"Filtering redundant points ({cursor} points before dedup)")
         xyz_index_arr = map_3d(np.concatenate([
-            xyz_arr[:cursor], 
-            distance2cam_arr[:cursor].reshape(-1,1), 
+            xyz_arr[:cursor],
+            distance2cam_arr[:cursor].reshape(-1,1),
             np.arange(len(xyz_arr)).reshape(-1, 1)[:cursor]], axis=1), get_closest_to_centroid_with_attributes_of_closest_to_cam, 0.003)
         filtered_indices = xyz_index_arr[:, -1].astype(np.uint32)
 
         return xyz_index_arr[:,:3], distance2cam_arr[:cursor][filtered_indices], seg_arr[:cursor][filtered_indices], frame_index_arr[:cursor][filtered_indices], depth_unc_arr[:cursor][filtered_indices], keep_masks, dist_cutoffs
         
     
-def tsdf_point_cloud(img_list, depths, masks, poses, intrinsics, cutoff, frames_per_volume, tsdf_overlap,dist_cutoffs): 
-    # TODO Magic Numbers
+def tsdf_point_cloud(img_list, depths, masks, poses, intrinsics, cutoff, frames_per_volume, tsdf_overlap, dist_cutoffs, camera_type="eucm"):
+    """Integrate frames into a TSDF volume and extract a point cloud.
+
+    When *camera_type* is ``"eucm"``, each frame is rectified from fisheye to
+    pinhole before integration (original behaviour).  When ``"pinhole"``, the
+    frames are already rectified so we skip that step and use them directly.
+    """
     xyz = []
     rgb = []
 
+    # Scale voxel size based on depth range to avoid OOM with metric depth
+    # Legacy model: ~0.6mm voxels for ~0.2m depth range
+    # DA3 model: scale proportionally (e.g., ~3mm voxels for ~1m depth)
+    base_voxel = 0.3 / 512.0  # ~0.0006m
+    depth_scale = max(1.0, cutoff / 0.2)  # Scale relative to legacy 0.2m
+    voxel_length = base_voxel * min(depth_scale, 10.0)  # Cap at 10x
+    sdf_trunc = 0.035 * min(depth_scale, 10.0)
+    print(f"TSDF voxel_length={voxel_length:.4f}m, sdf_trunc={sdf_trunc:.4f}m")
 
     volume = o3d.pipelines.integration.ScalableTSDFVolume(
-        voxel_length=0.3 / 512.0, 
-        sdf_trunc=0.035,
+        voxel_length=voxel_length,
+        sdf_trunc=sdf_trunc,
         color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8)
     totensor = torchvision.transforms.ToTensor()
 
     mask_out_background = np.ones_like(masks[0].astype(np.float32))
-    intrinsics = torch.tensor(intrinsics).float()
+    intrinsics_t = torch.tensor(intrinsics).float()
 
-    #TODO: Magic numbers
-    mask_out_background[:170,80:-80] *= 0 
+    # Mask out fisheye border region (only for legacy EUCM, not DA3 pinhole)
+    if camera_type == "eucm":
+        mask_out_background[:170, 80:-80] *= 0
     for i in tqdm(range(len(poses))):
-    
+
         if i > len(poses)-10:
             mask_out_background = np.ones_like(masks[0])
 
-        # Rectify to linear intrinsics
-        projected_img, projected_mask, projected_depth = rectify_eucm(
-            totensor(Image.open(img_list[i])).unsqueeze(0), 
-            torch.tensor(masks[i].astype(np.float32)*mask_out_background).unsqueeze(0).unsqueeze(0).float(),
-            torch.tensor(depths[i]).unsqueeze(0).unsqueeze(0), 
-            intrinsics[i]
-        )
+        mask_i = masks[i].astype(np.float32) * mask_out_background
 
-        depth = o3d.geometry.Image(projected_depth*projected_mask)
-        color = o3d.geometry.Image(np.ascontiguousarray(projected_img.transpose(1, 2, 0)*255.).astype(np.uint8))
+        if camera_type == "eucm":
+            # Rectify fisheye frame to pinhole for TSDF integration
+            projected_img, projected_mask, projected_depth = rectify_eucm(
+                totensor(Image.open(img_list[i])).unsqueeze(0),
+                torch.tensor(mask_i).unsqueeze(0).unsqueeze(0).float(),
+                torch.tensor(depths[i]).unsqueeze(0).unsqueeze(0),
+                intrinsics_t[i]
+            )
+            frame_fx = float(intrinsics_t[i][0])
+            frame_fy = float(intrinsics_t[i][1])
+            frame_cx = float(intrinsics_t[i][2])
+            frame_cy = float(intrinsics_t[i][3])
+        else:
+            # Pinhole: frames are already rectified, use directly.
+            # Resize image to match depth map dimensions (height x width).
+            img_pil = Image.open(img_list[i]).resize(
+                (args.width, args.height), Image.BILINEAR
+            )
+            img_np = np.array(img_pil, dtype=np.uint8)  # [H, W, 3]
+            projected_img_hwc = img_np
+            projected_mask = mask_i.astype(np.float32)
+            projected_depth = np.ascontiguousarray(
+                depths[i].astype(np.float32) * projected_mask
+            )
+            frame_fx = float(intrinsics[i][0])
+            frame_fy = float(intrinsics[i][1])
+            frame_cx = float(intrinsics[i][2])
+            frame_cy = float(intrinsics[i][3])
+
+            depth_img = o3d.geometry.Image(projected_depth)
+            color_img = o3d.geometry.Image(np.ascontiguousarray(projected_img_hwc))
+
+        if camera_type == "eucm":
+            # EUCM path outputs [3,H,W] float arrays, convert here
+            masked_depth = np.ascontiguousarray(
+                (projected_depth * projected_mask).astype(np.float32)
+            )
+            depth_img = o3d.geometry.Image(masked_depth)
+            color_img = o3d.geometry.Image(
+                np.ascontiguousarray(projected_img.transpose(1, 2, 0) * 255.0).astype(np.uint8)
+            )
 
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-            color, depth, depth_trunc=dist_cutoffs[i], convert_rgb_to_intensity=False, depth_scale=1)
-        
-        volume.integrate(
-            rgbd,
-            o3d.camera.PinholeCameraIntrinsic(
-            width= args.width,
-            height= args.height,
-            fx=intrinsics[i][0],
-            fy=intrinsics[i][1],
-            cx=intrinsics[i][2],
-            cy=intrinsics[i][3],
-        ),
-            np.linalg.inv(poses[i]))
+            color_img, depth_img, depth_trunc=dist_cutoffs[i], convert_rgb_to_intensity=False, depth_scale=1)
+
+        cam_intrinsic = o3d.camera.PinholeCameraIntrinsic(
+            width=args.width,
+            height=args.height,
+            fx=frame_fx,
+            fy=frame_fy,
+            cx=frame_cx,
+            cy=frame_cy,
+        )
+
+        # Skip frames with singular pose matrices
+        try:
+            pose_inv = np.linalg.inv(poses[i])
+        except np.linalg.LinAlgError:
+            print(f"Warning: Skipping frame {i} due to singular pose matrix")
+            continue
+
+        volume.integrate(rgbd, cam_intrinsic, pose_inv)
+
         if (i % frames_per_volume) == (frames_per_volume - tsdf_overlap):
             volume2 = o3d.pipelines.integration.ScalableTSDFVolume(
-                voxel_length=0.3 / 512.0, 
-                sdf_trunc=0.015,
+                voxel_length=voxel_length,
+                sdf_trunc=sdf_trunc * 0.5,
                 color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
             )
 
         if i % frames_per_volume >= (frames_per_volume - tsdf_overlap):
-            volume2.integrate(
-                rgbd,
-                o3d.camera.PinholeCameraIntrinsic(
-                width= args.width,
-                height= args.height,
-                fx=intrinsics[i][0],
-                fy=intrinsics[i][1],
-                cx=intrinsics[i][2],
-                cy=intrinsics[i][3],
-            ),
-            np.linalg.inv(poses[i]))
+            volume2.integrate(rgbd, cam_intrinsic, pose_inv)
+
         if (i % frames_per_volume) == frames_per_volume - 1:
             pc = volume.extract_point_cloud()
             pc = volume.extract_point_cloud()
             xyz.append(np.array(pc.points))
             rgb.append((np.array(pc.colors)*255).astype(np.uint8))
             volume = volume2
+
     pc = volume.extract_point_cloud()
     pc = volume.extract_point_cloud()
     xyz.append(np.array(pc.points))

@@ -7,7 +7,7 @@ src/tmp
 tmp
 *.MP4
 *.mp4
-
+output*/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -171,3 +171,9 @@ cython_debug/
 .history
 .vscode
 gpmfstream/
+
+# DA3-Streaming (external dependency — install separately, see CLAUDE.md)
+src/da3_streaming/
+
+# Large data files
+example_data.zip
