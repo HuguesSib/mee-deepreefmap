@@ -357,8 +357,16 @@ def _unproject_depth_pinhole(depth_map, fx, fy, cx, cy):
     return torch.from_numpy(np.stack([x, y, z], axis=0).reshape(3, -1))
 
 
-def get_point_cloud(image_list, depths, poses, depth_uncertainties, semantic_segmentation, intrinsics, label_to_color, class_to_label, h5f, args, camera_type="eucm", depth_confidences=None):
-    ignore_classes = args.ignore_classes_in_point_cloud.split(",")
+def get_point_cloud(
+    image_list: list[str],
+    depths: np.ndarray,
+    poses: np.ndarray,
+    depth_uncertainties: np.ndarray,
+    semantic_segmentation: np.ndarray,
+    intrinsics: np.ndarray,
+    label_to_color: dict[int, tuple[int, int, int]],
+    class_to_label: dict[str, int], h5f, args, camera_type="eucm", depth_confidences=None):
+    ignore_classes: list[str] = args.ignore_classes_in_point_cloud.split(",")
 
     def class_to_color(class_arr):
         color_arr = np.zeros((class_arr.shape[0], 3), dtype=np.uint8)
@@ -423,9 +431,8 @@ def get_point_cloud(image_list, depths, poses, depth_uncertainties, semantic_seg
             # Exclude points on the 'edge' of objects (high depth gradient)
             keep_mask = torch.logical_and(get_edgeness(depth_i_tensor) < edgeness_thresh, keep_mask)
 
-            # Mask out fisheye border region (only for legacy EUCM, not DA3 pinhole)
-            if camera_type == "eucm":
-                keep_mask[30:170, 30:-30] = 0
+            # Mask out fisheye border region
+            keep_mask[30:170, 30:-30] = 0
 
             for class_name in ignore_classes:
                 keep_mask = torch.logical_and(seg != class_to_label[class_name], keep_mask)
@@ -465,7 +472,19 @@ def get_point_cloud(image_list, depths, poses, depth_uncertainties, semantic_seg
         return xyz_index_arr[:,:3], distance2cam_arr[:cursor][filtered_indices], seg_arr[:cursor][filtered_indices], frame_index_arr[:cursor][filtered_indices], depth_unc_arr[:cursor][filtered_indices], keep_masks, dist_cutoffs
         
     
-def tsdf_point_cloud(img_list, depths, masks, poses, intrinsics, cutoff, frames_per_volume, tsdf_overlap, dist_cutoffs, camera_type="eucm", tsdf_voxel_size=None):
+def tsdf_point_cloud(
+    img_list: list[str],
+    depths: np.ndarray,
+    masks: np.ndarray,
+    poses: np.ndarray,
+    intrinsics: np.ndarray,
+    cutoff: float,
+    frames_per_volume: int,
+    tsdf_overlap: int,
+    dist_cutoffs: list[float],
+    camera_type: str = "eucm",
+    tsdf_voxel_size: float | None = None,
+):
     """Integrate frames into a TSDF volume and extract a point cloud.
 
     When *camera_type* is ``"eucm"``, each frame is rectified from fisheye to
@@ -502,9 +521,9 @@ def tsdf_point_cloud(img_list, depths, masks, poses, intrinsics, cutoff, frames_
     mask_out_background = np.ones_like(masks[0].astype(np.float32))
     intrinsics_t = torch.tensor(intrinsics).float()
 
-    # Mask out fisheye border region (only for legacy EUCM, not DA3 pinhole)
-    if camera_type == "eucm":
-        mask_out_background[:170, 80:-80] *= 0
+    # Mask out fisheye border region
+    mask_out_background[:170, 80:-80] *= 0
+    
     for i in tqdm(range(len(poses))):
 
         if i > len(poses)-10:
