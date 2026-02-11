@@ -45,6 +45,7 @@ parser.add_argument('--reverse', action='store_true', help='Whether the transect
 parser.add_argument('--number_of_points_per_image', type=int, default=2000, help='Number of points to sample from each image')
 parser.add_argument('--frames_per_volume', type=int, default=500, help='Number of frames per TSDF Volume')
 parser.add_argument('--tsdf_overlap', type=int, default=100, help='Overlap in frames over TSDF Volumes')
+parser.add_argument('--tsdf_voxel_size', type=float, default=None, help='TSDF voxel size in metres (auto-computed from depth range if not set). Use the same value for both models for fair comparison.')
 parser.add_argument('--distance_thresh', type=float, default=0.2, help='Distance threshold for points added to cloud')
 parser.add_argument('--ignore_classes_in_point_cloud', type=str, default="background,fish,human", help='Classes to ignore when adding points to cloud')
 parser.add_argument('--ignore_classes_in_benthic_cover', type=str, default="background,fish,human,transect tools,transect line,dark", help='Classes to ignore when calculating benthic cover percentages')
@@ -127,7 +128,19 @@ def main(args):
     )
 
     print("Integrating TSDF!")
-    tsdf_xyz, tsdf_rgb = tsdf_point_cloud(img_list, depths, keep_masks, poses, intrinsics, np.mean(depths), args.frames_per_volume, args.tsdf_overlap, dist_cutoffs, camera_type=camera_type)
+    tsdf_xyz, tsdf_rgb = tsdf_point_cloud(
+        img_list,
+        depths,
+        keep_masks,
+        poses,
+        intrinsics,
+        np.mean(depths),
+        args.frames_per_volume,
+        args.tsdf_overlap,
+        dist_cutoffs,
+        camera_type=camera_type,
+        tsdf_voxel_size=args.tsdf_voxel_size,
+    )
     print("Integrated TSDF Point Cloud in ", time() - t, "seconds")
 
     idx = get_matching_indices(tsdf_xyz, xyz_index_arr)
@@ -236,9 +249,11 @@ def get_nn_predictions(img_list, grav, num_classes, h5f, args):
     depth_q95 = float(np.quantile(depths[depths > 0], 0.95))
     print(f"Depth stats: median={depth_median:.3f}m, 95th-pct={depth_q95:.3f}m")
 
-    # Auto-adjust distance_thresh if the user left the default and it's clearly
-    # too small for the actual depth range (e.g., DA3 metric depth in real metres).
-    if args.distance_thresh == 0.2 and depth_median > 0.5:
+    # Auto-adjust distance_thresh to the 90th percentile of the actual depth
+    # distribution when the user hasn't explicitly set it.  This ensures both
+    # legacy (relative depth) and DA3 (metric depth) keep the same fraction
+    # of their depth range -- important for fair comparison.
+    if args.distance_thresh == 0.2:
         old_thresh = args.distance_thresh
         args.distance_thresh = float(np.quantile(depths[depths > 0], 0.90))
         print(
@@ -350,6 +365,16 @@ def get_point_cloud(image_list, depths, poses, depth_uncertainties, semantic_seg
         for val in np.unique(class_arr):
             color_arr[class_arr==val] = label_to_color[val]
         return color_arr
+
+    # Scale the edge detection threshold relative to the depth range so it
+    # has the same *relative* effect for both legacy (small relative depths)
+    # and DA3 (metric depths).  Reference: 0.04 was tuned for legacy with
+    # median depth ~0.15.
+    _reference_depth = 0.15
+    _depth_median = float(np.median(depths[depths > 0]))
+    edgeness_thresh = 0.04 * (_depth_median / _reference_depth)
+    print(f"Edgeness threshold: {edgeness_thresh:.4f} (depth_median={_depth_median:.3f})")
+
     dist_cutoffs = []
     with torch.no_grad():
 
@@ -383,13 +408,20 @@ def get_point_cloud(image_list, depths, poses, depth_uncertainties, semantic_seg
             keep_mask = depth_i_tensor.squeeze() < args.distance_thresh
             seg = torch.tensor(semantic_segmentation[i]).to(device)
 
-            # Filter by depth confidence (e.g. from DA3)
+            # Filter by depth quality: confidence (DA3) or uncertainty (legacy).
+            # Both models get equivalent quality filtering so comparison is fair.
             if depth_confidences is not None and args.conf_threshold > 0:
                 conf_i = torch.tensor(depth_confidences[i]).to(device)
                 keep_mask = torch.logical_and(keep_mask, conf_i > args.conf_threshold)
+            elif depth_uncertainties is not None:
+                unc_i = torch.tensor(depth_uncertainties[i]).to(device)
+                # Reject pixels with uncertainty > 20% of the local depth value
+                depth_i_safe = depth_i_tensor.squeeze().clamp(min=1e-6)
+                relative_unc = unc_i / depth_i_safe
+                keep_mask = torch.logical_and(keep_mask, relative_unc < 0.2)
 
             # Exclude points on the 'edge' of objects (high depth gradient)
-            keep_mask = torch.logical_and(get_edgeness(depth_i_tensor) < 0.04, keep_mask)
+            keep_mask = torch.logical_and(get_edgeness(depth_i_tensor) < edgeness_thresh, keep_mask)
 
             # Mask out fisheye border region (only for legacy EUCM, not DA3 pinhole)
             if camera_type == "eucm":
@@ -433,7 +465,7 @@ def get_point_cloud(image_list, depths, poses, depth_uncertainties, semantic_seg
         return xyz_index_arr[:,:3], distance2cam_arr[:cursor][filtered_indices], seg_arr[:cursor][filtered_indices], frame_index_arr[:cursor][filtered_indices], depth_unc_arr[:cursor][filtered_indices], keep_masks, dist_cutoffs
         
     
-def tsdf_point_cloud(img_list, depths, masks, poses, intrinsics, cutoff, frames_per_volume, tsdf_overlap, dist_cutoffs, camera_type="eucm"):
+def tsdf_point_cloud(img_list, depths, masks, poses, intrinsics, cutoff, frames_per_volume, tsdf_overlap, dist_cutoffs, camera_type="eucm", tsdf_voxel_size=None):
     """Integrate frames into a TSDF volume and extract a point cloud.
 
     When *camera_type* is ``"eucm"``, each frame is rectified from fisheye to
@@ -446,10 +478,19 @@ def tsdf_point_cloud(img_list, depths, masks, poses, intrinsics, cutoff, frames_
     # Scale voxel size based on depth range to avoid OOM with metric depth
     # Legacy model: ~0.6mm voxels for ~0.2m depth range
     # DA3 model: scale proportionally (e.g., ~3mm voxels for ~1m depth)
-    base_voxel = 0.3 / 512.0  # ~0.0006m
-    depth_scale = max(1.0, cutoff / 0.2)  # Scale relative to legacy 0.2m
-    voxel_length = base_voxel * min(depth_scale, 10.0)  # Cap at 10x
-    sdf_trunc = 0.035 * min(depth_scale, 10.0)
+    if tsdf_voxel_size is not None:
+        voxel_length = tsdf_voxel_size
+    else:
+        base_voxel = 0.3 / 512.0  # ~0.0006m
+        depth_scale = max(1.0, cutoff / 0.2)  # Scale relative to legacy 0.2m
+        voxel_length = base_voxel * min(depth_scale, 10.0)  # Cap at 10x
+    # SDF truncation distance: controls the "blur radius" around each surface.
+    # Legacy (EUCM): use original absolute truncation (hand-tuned, ~58x voxel).
+    # DA3 (pinhole): use standard ratio (~6x voxel) per Open3D/TSDF best practice.
+    if camera_type == "eucm":
+        sdf_trunc = 0.035 * max(1.0, cutoff / 0.2)
+    else:
+        sdf_trunc = voxel_length * 6.0
     print(f"TSDF voxel_length={voxel_length:.4f}m, sdf_trunc={sdf_trunc:.4f}m")
 
     volume = o3d.pipelines.integration.ScalableTSDFVolume(

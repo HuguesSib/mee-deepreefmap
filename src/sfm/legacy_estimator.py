@@ -19,14 +19,13 @@ import torchvision.transforms.functional as F
 from PIL import Image
 from tqdm import tqdm
 
-from reconstruction_utils import get_rotation_matrix_to_align_pose_with_gravity
-from sfm.estimator import DepthPoseEstimator, EstimatorOutput
+from sfm.estimator import DepthPoseEstimator, EstimatorOutput, accumulate_poses_with_gravity
 from sfm.inverse_warp import pose_vec2mat
 from sfm.model import SfMModel
 
 
 # ---------------------------------------------------------------------------
-# Helpers (moved from reconstruct.py to keep them close to the only user)
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _reset_batchnorm_layers(model: nn.Module) -> None:
@@ -39,60 +38,6 @@ def _change_bn_momentum(model: nn.Module, value: float) -> None:
     for module in model.modules():
         if isinstance(module, nn.BatchNorm2d):
             module.momentum = value
-
-
-# ---------------------------------------------------------------------------
-# Gravity-based pose correction
-# ---------------------------------------------------------------------------
-
-def _accumulate_poses_with_gravity(
-    relative_poses: np.ndarray,
-    gravity: np.ndarray | None,
-    grav_buffer: int = 100,
-) -> np.ndarray:
-    """Convert relative poses to cumulative absolute poses with gravity alignment.
-
-    Parameters
-    ----------
-    relative_poses : np.ndarray
-        ``[N-1, 4, 4]`` relative frame-to-frame transforms.
-    gravity : np.ndarray | None
-        ``[N, 3]`` per-frame gravity vectors, or ``None``.
-    grav_buffer : int
-        Smoothing window for gravity vectors.
-
-    Returns
-    -------
-    np.ndarray
-        ``[N, 4, 4]`` cumulative camera-to-world poses.
-    """
-    n_relative = len(relative_poses)
-
-    if gravity is not None:
-        pose0 = np.eye(4)
-        cum_poses = np.zeros((n_relative + 1, 4, 4))
-
-        grav0 = np.mean(gravity[:grav_buffer], axis=0)
-        correction = get_rotation_matrix_to_align_pose_with_gravity(pose0, grav0)
-        pose0[:3, :3] = correction @ pose0[:3, :3]
-        cum_poses[0] = pose0.copy()
-
-        for i, (rel, _g) in enumerate(zip(relative_poses, gravity[1:])):
-            g = np.mean(
-                gravity[max(0, 1 + i - grav_buffer): min(i + grav_buffer, len(gravity) - 1)],
-                axis=0,
-            )
-            pose0 = pose0 @ rel
-            correction = get_rotation_matrix_to_align_pose_with_gravity(pose0, g)
-            pose0[:3, :3] = correction @ pose0[:3, :3]
-            cum_poses[i + 1] = pose0.copy()
-    else:
-        cum_poses = np.zeros((n_relative + 1, 4, 4))
-        cum_poses[0] = np.eye(4)
-        for i in range(n_relative):
-            cum_poses[i + 1] = cum_poses[i] @ relative_poses[i]
-
-    return cum_poses
 
 
 # ---------------------------------------------------------------------------
@@ -132,10 +77,6 @@ class LegacySfMEstimator(DepthPoseEstimator):
             mean=[0.45, 0.45, 0.45], std=[0.225, 0.225, 0.225]
         )
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def predict(
         self,
         img_list: list[str],
@@ -152,7 +93,7 @@ class LegacySfMEstimator(DepthPoseEstimator):
 
         # --- Convert raw pairwise poses to cumulative absolute poses ---
         relative_poses = self._relative_poses_from_raw(raw_poses)
-        poses = _accumulate_poses_with_gravity(relative_poses, gravity)
+        poses = accumulate_poses_with_gravity(relative_poses, gravity)
 
         return EstimatorOutput(
             depths=depths,
@@ -161,10 +102,6 @@ class LegacySfMEstimator(DepthPoseEstimator):
             camera_type="eucm",
             depth_uncertainties=depth_uncertainties,
         )
-
-    # ------------------------------------------------------------------
-    # Internal: sliding-window depth/pose inference
-    # ------------------------------------------------------------------
 
     def _run_sliding_window(
         self,
@@ -255,10 +192,6 @@ class LegacySfMEstimator(DepthPoseEstimator):
         h5f.close()
         return depths, depth_unc, intrinsics_out, raw_poses
 
-    # ------------------------------------------------------------------
-    # Internal: pose helpers
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _relative_poses_from_raw(raw_poses: dict) -> np.ndarray:
         """Convert raw pairwise pose predictions to relative 4x4 transforms.
@@ -279,10 +212,6 @@ class LegacySfMEstimator(DepthPoseEstimator):
         med_rot = np.median(rel[:, :3, :3] - np.eye(3), axis=0)
         rel[:, :3, :3] -= med_rot
         return rel
-
-    # ------------------------------------------------------------------
-    # Internal: image loading
-    # ------------------------------------------------------------------
 
     def _load_image(self, path: str, device: torch.device) -> torch.Tensor:
         """Load, normalize, and move a single frame to device. Returns ``[1, 3, H, W]``."""

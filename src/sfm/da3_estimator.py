@@ -6,10 +6,7 @@ with chunked processing, loop closure detection, and SIM3 alignment.
 
 from __future__ import annotations
 
-import json
-import os
 import shutil
-import tempfile
 from pathlib import Path
 from typing import Literal
 
@@ -17,7 +14,7 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-from sfm.estimator import DepthPoseEstimator, EstimatorOutput
+from sfm.estimator import DepthPoseEstimator, EstimatorOutput, accumulate_poses_with_gravity
 
 
 class DA3Estimator(DepthPoseEstimator):
@@ -77,6 +74,13 @@ class DA3Estimator(DepthPoseEstimator):
             output_dir, len(img_list), height, width
         )
 
+        # Apply gravity-based rotation correction to prevent drift ("banana"
+        # artifact on long sequences).  Decompose the absolute C2W poses from
+        # DA3-Streaming into relative transforms, then re-accumulate with
+        # per-frame gravity alignment from the GoPro IMU.
+        if gravity is not None:
+            poses = self._apply_gravity_correction(poses, gravity)
+
         return EstimatorOutput(
             depths=depths,
             poses=poses,
@@ -84,6 +88,29 @@ class DA3Estimator(DepthPoseEstimator):
             camera_type="pinhole",
             depth_confidences=confs,
         )
+
+    @staticmethod
+    def _apply_gravity_correction(
+        poses: np.ndarray, gravity: np.ndarray
+    ) -> np.ndarray:
+        """Re-accumulate DA3 absolute poses with gravity alignment.
+
+        DA3-Streaming outputs absolute C2W poses from visual odometry.  For
+        long linear transects the small rotation errors accumulate into a
+        curved ("banana") trajectory.  This method decomposes the absolute
+        poses into relative frame-to-frame transforms, then re-accumulates
+        them with per-frame gravity correction from the GoPro IMU -- the same
+        approach used by the legacy estimator.
+        """
+        n = len(poses)
+        # Decompose absolute C2W poses into relative transforms
+        relative_poses = np.zeros((n - 1, 4, 4), dtype=np.float64)
+        for i in range(n - 1):
+            relative_poses[i] = np.linalg.inv(poses[i]) @ poses[i + 1]
+
+        # Re-accumulate with gravity correction
+        corrected = accumulate_poses_with_gravity(relative_poses, gravity)
+        return corrected.astype(np.float32)
 
     def _run_streaming(self, frames_dir: Path, output_dir: Path) -> None:
         """Run DA3_Streaming on the frames directory."""
