@@ -26,15 +26,14 @@ class DA3Estimator(DepthPoseEstimator):
 
     def setup(self, device: str, args) -> None:
         self.device = device
-        self.model_name = getattr(args, "da3_model", "depth-anything/DA3-LARGE-1.1")
         self.chunk_size = getattr(args, "da3_chunk_size", 120)
         self.overlap = getattr(args, "da3_overlap", 60)
         self.loop_enable = getattr(args, "da3_loop_enable", True)
 
-        # Path to da3_streaming configs (local copy in src/)
+        # Path to da3_streaming configs (git submodule in external/)
         streaming_root = getattr(args, "da3_streaming_root", None)
         if streaming_root is None:
-            streaming_root = Path(__file__).parent.parent / "da3_streaming"
+            streaming_root = Path(__file__).parent.parent / "Depth-Anything-3" / "da3_streaming"
         self.da3_streaming_root = Path(streaming_root)
 
     def predict(
@@ -116,24 +115,19 @@ class DA3Estimator(DepthPoseEstimator):
         """Run DA3_Streaming on the frames directory."""
         import sys
 
-        # Ensure the parent of da3_streaming_root is on sys.path so that
-        # ``import da3_streaming`` resolves regardless of where the clone lives.
-        parent = str(self.da3_streaming_root.parent)
-        if parent not in sys.path:
-            sys.path.insert(0, parent)
+        # DA3-Streaming has no __init__.py and uses bare imports (loop_utils,
+        # fastloop, etc.) so it expects its own directory on sys.path.  Add it
+        # directly and use bare imports to match the upstream design.
+        streaming_dir = str(self.da3_streaming_root)
+        if streaming_dir not in sys.path:
+            sys.path.insert(0, streaming_dir)
 
-        from da3_streaming.da3_streaming import DA3_Streaming
-        from da3_streaming.loop_utils.config_utils import load_config 
+        from da3_streaming import DA3_Streaming  # noqa: E402
+        from loop_utils.config_utils import load_config  # noqa: E402
 
-        # Load base config
-        config_path = self.da3_streaming_root / "configs" / "base_config.yaml"
+        # Load base config (in src/configs/base_config.yaml)
+        config_path = Path(__file__).parent.parent / "configs" / "base_config.yaml"
         config = load_config(str(config_path))
-
-        # Configure for HuggingFace model
-        config["Weights"]["DA3"] = None
-        config["Weights"]["DA3_CONFIG"] = None
-        config["Weights"]["DA3_HF_MODEL"] = self.model_name
-        config["Weights"]["SALAD"] = str(self.da3_streaming_root / "weights" / "dino_salad.ckpt")
 
         # Override chunk settings
         config["Model"]["chunk_size"] = self.chunk_size
@@ -145,7 +139,6 @@ class DA3Estimator(DepthPoseEstimator):
         # Use torch for alignment (more compatible)
         config["Model"]["align_lib"] = "torch"
 
-        print(f"Running DA3-Streaming with {self.model_name}...")
         print(f"  chunk_size={self.chunk_size}, overlap={self.overlap}, loop_enable={self.loop_enable}")
 
         streaming = DA3_Streaming(str(frames_dir), str(output_dir), config)

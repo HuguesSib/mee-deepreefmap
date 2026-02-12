@@ -173,7 +173,10 @@ cython_debug/
 gpmfstream/
 
 # DA3-Streaming (external dependency — install separately, see CLAUDE.md)
-src/da3_streaming/
+src/Depth-Anything-3/
 
 # Large data files
 example_data.zip
+
+# Notebooks
+notebooks/
