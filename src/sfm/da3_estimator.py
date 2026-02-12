@@ -33,7 +33,7 @@ class DA3Estimator(DepthPoseEstimator):
         # Path to da3_streaming configs (git submodule in external/)
         streaming_root = getattr(args, "da3_streaming_root", None)
         if streaming_root is None:
-            streaming_root = Path(__file__).parent.parent / "Depth-Anything-3" / "da3_streaming"
+            streaming_root = Path(__file__).parent.parent.parent / "Depth-Anything-3" / "da3_streaming"
         self.da3_streaming_root = Path(streaming_root)
 
     def predict(

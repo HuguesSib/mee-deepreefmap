@@ -170,10 +170,7 @@ cython_debug/
 #.idea/
 .history
 .vscode
-gpmfstream/
-
-# DA3-Streaming (external dependency — install separately, see CLAUDE.md)
-src/Depth-Anything-3/
+# DA3-Streaming and gpmfstream are tracked as git submodules
 
 # Large data files
 example_data.zip
