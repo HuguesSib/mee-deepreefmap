@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+import subprocess
 from typing import Literal
 
 import numpy as np
@@ -128,6 +129,12 @@ class DA3Estimator(DepthPoseEstimator):
         # Load base config (in src/configs/base_config.yaml)
         config_path = Path(__file__).parent.parent / "configs" / "base_config.yaml"
         config = load_config(str(config_path))
+
+        # Check if the weights exist
+        if not Path(config["Weights"]["DA3"]).exists():
+            # Run the download_weights.sh script
+            download_weights_script = Path(__file__).parent.parent.parent.parent / "scripts" / "download_weights.sh"
+            subprocess.run(["bash", download_weights_script])
 
         # Override chunk settings
         config["Model"]["chunk_size"] = self.chunk_size
