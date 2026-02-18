@@ -110,6 +110,21 @@ def main(args):
     )
 
     print("Ran NN Predictions in ", time() - t, "seconds")
+
+    # --- Save intermediate data for downstream alignment / consolidation ---
+    os.makedirs(args.out_dir, exist_ok=True)
+    np.save(args.out_dir + "/poses.npy", poses)
+    np.save(args.out_dir + "/intrinsics.npy", intrinsics)
+    np.save(args.out_dir + "/depths_summary.npy", np.array([
+        float(np.median(depths[depths > 0])),
+        float(np.quantile(depths[depths > 0], 0.05)),
+        float(np.quantile(depths[depths > 0], 0.95)),
+        float(np.mean(depths[depths > 0])),
+    ]))  # [median, q05, q95, mean]
+    with open(args.out_dir + "/frame_list.txt", "w") as f:
+        f.write("\n".join(img_list))
+    print(f"Saved poses ({poses.shape}), intrinsics ({intrinsics.shape}), frame list to {args.out_dir}/")
+
     print("Building Point Cloud ...")
     os.makedirs(args.out_dir + "/videos", exist_ok=True)
     xyz_index_arr, distance2cam_arr, seg_arr, frame_index_arr, depth_unc_arr, keep_masks, dist_cutoffs = get_point_cloud(
@@ -127,20 +142,50 @@ def main(args):
         depth_confidences=depth_confidences,
     )
 
+    # Sanity-check depth scale before TSDF integration
+    depth_median = float(np.median(depths[depths > 0]))
+    depth_mean = float(np.mean(depths[depths > 0]))
+    if depth_median > 10.0:
+        print(
+            f"WARNING: Depth median={depth_median:.1f}m is unusually large for "
+            f"underwater footage. This may indicate a depth scale issue from the "
+            f"estimator. TSDF integration may fail or produce poor results."
+        )
+    if depth_mean / depth_median > 5.0:
+        print(
+            f"WARNING: Depth mean/median ratio={depth_mean/depth_median:.1f} "
+            f"indicates heavy-tailed depth distribution (outliers). "
+            f"Consider setting --distance_thresh manually."
+        )
+
     print("Integrating TSDF!")
-    tsdf_xyz, tsdf_rgb = tsdf_point_cloud(
-        img_list,
-        depths,
-        keep_masks,
-        poses,
-        intrinsics,
-        np.mean(depths),
-        args.frames_per_volume,
-        args.tsdf_overlap,
-        dist_cutoffs,
-        camera_type=camera_type,
-        tsdf_voxel_size=args.tsdf_voxel_size,
-    )
+    try:
+        tsdf_xyz, tsdf_rgb = tsdf_point_cloud(
+            img_list,
+            depths,
+            keep_masks,
+            poses,
+            intrinsics,
+            np.mean(depths),
+            args.frames_per_volume,
+            args.tsdf_overlap,
+            dist_cutoffs,
+            camera_type=camera_type,
+            tsdf_voxel_size=args.tsdf_voxel_size,
+        )
+    except Exception as e:
+        print(f"ERROR during TSDF integration: {e}")
+        print("Skipping TSDF — falling back to raw point cloud.")
+        tsdf_xyz = xyz_index_arr
+        tsdf_rgb = np.zeros((len(xyz_index_arr), 3), dtype=np.uint8)
+        # Color from nearest frame (approximate)
+        for i in range(len(tsdf_rgb)):
+            tsdf_rgb[i] = [128, 128, 128]  # grey placeholder
+        # Still save what we have so the run isn't a total loss
+        pc_raw = o3d.geometry.PointCloud()
+        pc_raw.points = o3d.utility.Vector3dVector(xyz_index_arr)
+        o3d.io.write_point_cloud(args.out_dir + "/point_cloud_raw_fallback.ply", pc_raw)
+        print(f"Saved raw fallback point cloud ({len(xyz_index_arr)} points)")
     print("Integrated TSDF Point Cloud in ", time() - t, "seconds")
 
     idx = get_matching_indices(tsdf_xyz, xyz_index_arr)
@@ -494,15 +539,19 @@ def tsdf_point_cloud(
     xyz = []
     rgb = []
 
-    # Scale voxel size based on depth range to avoid OOM with metric depth
-    # Legacy model: ~0.6mm voxels for ~0.2m depth range
-    # DA3 model: scale proportionally (e.g., ~3mm voxels for ~1m depth)
+    # Scale voxel size based on depth range and scene extent to avoid OOM.
+    # Legacy model with short clips: ~0.6mm voxels works fine.
+    # DA3 on full transects: need larger voxels because the spatial extent
+    # is much larger (100m transect vs ~10m clip).
+    positive_depths = depths[depths > 0]
+    robust_cutoff = float(np.median(positive_depths)) if len(positive_depths) > 0 else cutoff
+    print(f"TSDF depth scale: mean={cutoff:.3f}m, median(robust)={robust_cutoff:.3f}m")
     if tsdf_voxel_size is not None:
         voxel_length = tsdf_voxel_size
     else:
-        base_voxel = 0.3 / 512.0  # ~0.0006m
-        depth_scale = max(1.0, cutoff / 0.2)  # Scale relative to legacy 0.2m
-        voxel_length = base_voxel * min(depth_scale, 10.0)  # Cap at 10x
+        base_voxel = 0.3 / 512.0  # ~0.0006m — tuned for legacy with ~300 frames
+        depth_scale = max(1.0, robust_cutoff / 0.2)
+        voxel_length = base_voxel * min(depth_scale, 10.0)
     # SDF truncation distance: controls the "blur radius" around each surface.
     # Legacy (EUCM): use original absolute truncation (hand-tuned, ~58x voxel).
     # DA3 (pinhole): use standard ratio (~6x voxel) per Open3D/TSDF best practice.

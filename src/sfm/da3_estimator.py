@@ -48,26 +48,41 @@ class DA3Estimator(DepthPoseEstimator):
         """Run DA3-Streaming and return globally-aligned depth/poses."""
 
         # Create temporary directory for frames and output.
-        # Clean any stale data from previous runs to avoid mixing results.
         tmp_dir = Path(args.tmp_dir) / "da3_streaming"
         frames_dir = tmp_dir / "frames"
         output_dir = tmp_dir / "output"
-        if frames_dir.exists():
-            shutil.rmtree(frames_dir)
-        if output_dir.exists():
-            shutil.rmtree(output_dir)
-        frames_dir.mkdir(parents=True, exist_ok=True)
-        output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Resize and copy frames to frames_dir (DA3_Streaming expects a directory)
-        print(f"Preparing {len(img_list)} frames for DA3-Streaming...")
-        for i, img_path in enumerate(tqdm(img_list, desc="Linking frames")):
-            dst = frames_dir / f"{i:07d}.jpg"
-            img = Image.open(img_path).resize((width, height), Image.BILINEAR)
-            img.save(dst, quality=95)
+        # Reuse cached DA3-Streaming results if they exist and match the
+        # expected frame count.  This avoids re-running the expensive
+        # inference (~17 min) when only downstream steps need re-running.
+        results_dir = output_dir / "results_output"
+        poses_path = output_dir / "camera_poses.txt"
+        cached = (
+            results_dir.exists()
+            and poses_path.exists()
+            and len(list(results_dir.glob("frame_*.npz"))) == len(img_list)
+        )
 
-        # Run DA3-Streaming
-        self._run_streaming(frames_dir, output_dir)
+        if cached:
+            print(f"Reusing cached DA3-Streaming results ({len(img_list)} frames in {output_dir})")
+        else:
+            # Clean stale data from previous runs to avoid mixing results.
+            if frames_dir.exists():
+                shutil.rmtree(frames_dir)
+            if output_dir.exists():
+                shutil.rmtree(output_dir)
+            frames_dir.mkdir(parents=True, exist_ok=True)
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+            # Resize and copy frames to frames_dir (DA3_Streaming expects a directory)
+            print(f"Preparing {len(img_list)} frames for DA3-Streaming...")
+            for i, img_path in enumerate(tqdm(img_list, desc="Linking frames")):
+                dst = frames_dir / f"{i:07d}.jpg"
+                img = Image.open(img_path).resize((width, height), Image.BILINEAR)
+                img.save(dst, quality=95)
+
+            # Run DA3-Streaming
+            self._run_streaming(frames_dir, output_dir)
 
         # Load results
         depths, poses, intrinsics, confs = self._load_streaming_output(
