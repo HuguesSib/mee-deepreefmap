@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import shutil
 from time import time
 
 import h5py
@@ -121,9 +122,12 @@ def main(args):
         float(np.quantile(depths[depths > 0], 0.95)),
         float(np.mean(depths[depths > 0])),
     ]))  # [median, q05, q95, mean]
-    with open(args.out_dir + "/frame_list.txt", "w") as f:
-        f.write("\n".join(img_list))
-    print(f"Saved poses ({poses.shape}), intrinsics ({intrinsics.shape}), frame list to {args.out_dir}/")
+    
+    frames_out = args.out_dir + "/frames"
+    os.makedirs(frames_out, exist_ok=True)
+    for i, frame in enumerate(img_list):
+        shutil.copy(frame, frames_out + "/" + str(i) + ".jpg")
+    print(f"Saved poses ({poses.shape}), intrinsics ({intrinsics.shape}), frames to {frames_out}/")
 
     print("Building Point Cloud ...")
     os.makedirs(args.out_dir + "/videos", exist_ok=True)

@@ -175,5 +175,8 @@ cython_debug/
 # Large data files
 example_data.zip
 
-# Notebooks
-notebooks/
+# Notebooks except for 
+# notebooks/*.ipynb
+notebooks/*.png
+notebooks/__marimo__/
+notebooks/*.ply
