@@ -171,3 +171,9 @@ cython_debug/
 .history
 .vscode
 gpmfstream/
+
+
+/output/
+/notebooks/
+/work/
+process_transects.log
