@@ -116,6 +116,8 @@ def main(args):
     os.makedirs(args.out_dir, exist_ok=True)
     np.save(args.out_dir + "/poses.npy", poses)
     np.save(args.out_dir + "/intrinsics.npy", intrinsics)
+    if grav is not None:
+        np.save(args.out_dir + "/gravity.npy", grav)
     np.save(args.out_dir + "/depths_summary.npy", np.array([
         float(np.median(depths[depths > 0])),
         float(np.quantile(depths[depths > 0], 0.05)),
