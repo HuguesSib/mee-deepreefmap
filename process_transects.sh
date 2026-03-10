@@ -9,7 +9,7 @@ set -euo pipefail
 
 # --- Configuration -----------------------------------------------------------
 RCP_HOST="rcp"
-RCP_BASE="/mnt/eceo/scratch/datasets/coral/TRSC_er_10_2025_3D"
+RCP_BASE="/mnt/eceo/scratch/datasets/coral/2025_10_eritrea/TRSC_er_102025_data/TRSC_er_10_2025_3D"
 CSV_FILE="transects.csv"
 FPS=10
 LOCAL_WORK_DIR="./work"
