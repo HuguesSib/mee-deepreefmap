@@ -11,7 +11,7 @@ from time import time
 import segmentation_models_pytorch as smp
 import segmentation
 from sfm.model import SfMModel
-from segmentation.model import SegmentationModel
+from segmentation.model import load_segmentation_model
 from video_utils import extract_frames_and_gopro_gravity_vector, render_video
 from tqdm import tqdm
 import h5py
@@ -33,7 +33,7 @@ parser.add_argument('--out_dir', type=str, default='out', help='Path to output d
 parser.add_argument('--tmp_dir', type=str, default='tmp', help='Path to temporary directory - will be created if does not exist')
 parser.add_argument('--timestamp', type=str, help='Begin and End timestamp of the transect. In case multiple videos are supplied, the format should be comma separated e.g. of the form "0:23-end,begin-1:44"')
 parser.add_argument('--sfm_checkpoint', type=str, default='../sfm_net.pth', help='Path to the sfm_net checkpoint')
-parser.add_argument('--segmentation_checkpoint', type=str, default='../segmentation_net.pth', help='Path to the segmentation_net checkpoint')
+parser.add_argument('--segmentation_checkpoint', type=str, default='EPFL-ECEO/segformer-b5-finetuned-coralscapes-1024-1024', help='HuggingFace model ID or local path for the segmentation model')
 parser.add_argument('--height', type=int, default=384, help='Height in pixels to which input video is scaled')
 parser.add_argument('--width', type=int, default=640, help='Width in pixels to which input video is scaled')
 parser.add_argument('--seg_height', type=int, default=384*2, help='Height in pixels to which input video is scaled')
@@ -84,9 +84,8 @@ def main(args):
     print("Running Neural Networks ...")
     
     depths, depth_uncertainties, poses, semantic_segmentation, intrinsics = get_nn_predictions(
-        img_list, 
-        grav, 
-        len(class_to_label) + 1,
+        img_list,
+        grav,
         h5f,
         args,
     )
@@ -175,7 +174,7 @@ def expand_zeros(mask):
 
     return result_mask
 
-def get_nn_predictions(img_list, grav, num_classes, h5f, args):
+def get_nn_predictions(img_list, grav, h5f, args):
     totensor = torchvision.transforms.ToTensor()
     normalize = torchvision.transforms.Normalize(mean=[0.45, 0.45, 0.45],
                                                 std=[0.225, 0.225, 0.225])
@@ -185,9 +184,9 @@ def get_nn_predictions(img_list, grav, num_classes, h5f, args):
     reset_batchnorm_layers(sfm_model)
     sfm_model.eval()
 
-    segmentation_model = SegmentationModel(num_classes).to(device)
-    segmentation_model.load_state_dict(torch.load(args.segmentation_checkpoint, map_location=device))
-    segmentation_model.eval()
+    segmentation_model, seg_preprocessor = load_segmentation_model(args.segmentation_checkpoint)
+    segmentation_model = segmentation_model.to(device).eval()
+    num_classes = segmentation_model.config.num_labels
     
     intrinsics = torch.tensor(list(json.load(open(args.intrinsics_file)).values())).float().to(device).unsqueeze(0)
 
@@ -209,7 +208,7 @@ def get_nn_predictions(img_list, grav, num_classes, h5f, args):
     with torch.no_grad():
         semseg_logits = []
         for i in range(buffer_size-1):
-            semseg_logits.append(segmentation.model.predict(segmentation_model, images[i], num_classes, args.height, args.width))
+            semseg_logits.append(segmentation.model.predict(segmentation_model, seg_preprocessor, Image.open(img_list[i]), args.height, args.width))
 
         
         for i in range(buffer_size-2):
@@ -229,7 +228,7 @@ def get_nn_predictions(img_list, grav, num_classes, h5f, args):
 
         
         with torch.no_grad():
-            semseg_buffer[2] = segmentation.model.predict(segmentation_model, new_im, num_classes, args.height, args.width)
+            semseg_buffer[2] = segmentation.model.predict(segmentation_model, seg_preprocessor, Image.open(img_list[end_index]), args.height, args.width)
             semantic_segmentation[end_index-1] = (semseg_buffer*wtens).mean(dim=0).argmax(dim=0).cpu().numpy()
             semseg_buffer[:2] = semseg_buffer[1:].clone()
 

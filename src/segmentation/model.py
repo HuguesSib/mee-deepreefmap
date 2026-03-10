@@ -1,5 +1,5 @@
 import segmentation_models_pytorch as smp
-import torch.nn as nn 
+import torch.nn as nn
 import torch
 import numpy as np
 import torchvision
@@ -9,10 +9,19 @@ import wandb
 from time import time
 import torchvision.transforms.functional as F
 import torchvision.transforms as transforms
+from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Legacy model used for training only
 SegmentationModel = lambda classes: smp.DeepLabV3Plus(encoder_name="resnext50_32x4d", classes=classes)
+
+
+def load_segmentation_model(model_name_or_path):
+    """Load a SegFormer segmentation model and its preprocessor from a HuggingFace hub ID or local path."""
+    preprocessor = SegformerImageProcessor.from_pretrained(model_name_or_path)
+    model = SegformerForSemanticSegmentation.from_pretrained(model_name_or_path)
+    return model, preprocessor
 
 class SegmentationDataset(torch.utils.data.Dataset):
     def __init__(self, image_files, label_files, output_size, imagenet_normalization=False):
@@ -154,6 +163,13 @@ class BaselineExperiment:
         return prediction.numpy()
 
 
-def predict(model, image, num_classes, h, w):
-    prediction = model(image)
-    return F.resize(prediction, (h, w),interpolation=torchvision.transforms.InterpolationMode.BILINEAR).squeeze().cpu()
+def predict(model, preprocessor, pil_image, h, w):
+    """Run inference with a SegFormer model. Returns logits tensor of shape (num_classes, h, w)."""
+    model_device = next(model.parameters()).device
+    inputs = preprocessor(pil_image, return_tensors="pt")
+    inputs = {k: v.to(model_device) for k, v in inputs.items()}
+    outputs = model(**inputs)
+    # outputs.logits: (1, num_classes, H/4, W/4) -> resize to (num_classes, h, w)
+    logits = F.resize(outputs.logits.squeeze(0), (h, w),
+                      interpolation=torchvision.transforms.InterpolationMode.BILINEAR)
+    return logits.cpu()
