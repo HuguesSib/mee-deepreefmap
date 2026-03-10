@@ -8,22 +8,21 @@ from PIL import Image
 import pandas as pd
 import torch.nn as nn
 from time import time 
-import segmentation_models_pytorch as smp
 import segmentation
 from sfm.model import SfMModel
-from segmentation.model import SegmentationModel
+from segmentation.model import load_segmentation_model
 from video_utils import extract_frames_and_gopro_gravity_vector, render_video
 from tqdm import tqdm
 import h5py
 import open3d as o3d
 from sklearn.decomposition import PCA
 from reconstruction_utils import get_closest_to_centroid_with_attributes_of_closest_to_cam, map_3d, get_matching_indices, get_rotation_matrix_to_align_pose_with_gravity, get_edgeness, aggregate_2d_grid
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 from sfm.inverse_warp import EUCMCamera, Pose, pose_vec2mat, rectify_eucm
-import scipy
 import json
 
 import sys
+
+device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 sys.path.append('/home/jonathan/mee-deepreefmap/src/ffmpeg-7.0.2-amd64-static/ffmpeg')
 
 # Start by parsing args
@@ -33,7 +32,7 @@ parser.add_argument('--out_dir', type=str, default='out', help='Path to output d
 parser.add_argument('--tmp_dir', type=str, default='tmp', help='Path to temporary directory - will be created if does not exist')
 parser.add_argument('--timestamp', type=str, help='Begin and End timestamp of the transect. In case multiple videos are supplied, the format should be comma separated e.g. of the form "0:23-end,begin-1:44"')
 parser.add_argument('--sfm_checkpoint', type=str, default='../sfm_net.pth', help='Path to the sfm_net checkpoint')
-parser.add_argument('--segmentation_checkpoint', type=str, default='../segmentation_net.pth', help='Path to the segmentation_net checkpoint')
+parser.add_argument('--segmentation_checkpoint', type=str, default='EPFL-ECEO/segformer-b5-finetuned-coralscapes-1024-1024', help='HuggingFace model ID or local path for the segmentation model')
 parser.add_argument('--height', type=int, default=384, help='Height in pixels to which input video is scaled')
 parser.add_argument('--width', type=int, default=640, help='Width in pixels to which input video is scaled')
 parser.add_argument('--seg_height', type=int, default=384*2, help='Height in pixels to which input video is scaled')
@@ -51,6 +50,7 @@ parser.add_argument('--class_to_label_file', type=str, default="../example_input
 parser.add_argument('--class_to_color_file', type=str, default="../example_inputs/class_to_color.json", help='Path to class_to_color_file')
 parser.add_argument('--output_2d_grid_size', type=int, default=2000, help='Size of the 2D grid used for benthic cover analysis - a higher grid size will produce higher resolution outputs but takes longer to compute and may have empty grid cells')
 parser.add_argument('--buffer_size', type=int, default=2, help='Number of frames to use for temporal smoothing')
+parser.add_argument('--seg_batch_size', type=int, default=8, help='Batch size for segmentation inference')
 parser.add_argument('--render_video', action='store_true', help='Whether to render output 4-panel video')
 args = parser.parse_args()
 
@@ -84,9 +84,8 @@ def main(args):
     print("Running Neural Networks ...")
     
     depths, depth_uncertainties, poses, semantic_segmentation, intrinsics = get_nn_predictions(
-        img_list, 
-        grav, 
-        len(class_to_label) + 1,
+        img_list,
+        grav,
         h5f,
         args,
     )
@@ -175,7 +174,7 @@ def expand_zeros(mask):
 
     return result_mask
 
-def get_nn_predictions(img_list, grav, num_classes, h5f, args):
+def get_nn_predictions(img_list, grav, h5f, args):
     totensor = torchvision.transforms.ToTensor()
     normalize = torchvision.transforms.Normalize(mean=[0.45, 0.45, 0.45],
                                                 std=[0.225, 0.225, 0.225])
@@ -185,16 +184,15 @@ def get_nn_predictions(img_list, grav, num_classes, h5f, args):
     reset_batchnorm_layers(sfm_model)
     sfm_model.eval()
 
-    segmentation_model = SegmentationModel(num_classes).to(device)
-    segmentation_model.load_state_dict(torch.load(args.segmentation_checkpoint, map_location=device))
-    segmentation_model.eval()
-    
+    segmentation_model, seg_preprocessor = load_segmentation_model(args.segmentation_checkpoint)
+    segmentation_model = segmentation_model.to(device).eval()
+
     intrinsics = torch.tensor(list(json.load(open(args.intrinsics_file)).values())).float().to(device).unsqueeze(0)
 
     buffer_size = args.buffer_size
     # Start by initializing, load the images in a buffer of buffer_size subsequent frames
     images = [normalize(totensor(Image.open(img_list[i]))).to(device).unsqueeze(0) for i in range(buffer_size-1)]
-    
+
     counts = np.zeros(len(img_list), dtype=np.uint8)
     depths_buffered = h5f.create_dataset("depths_buffered", (args.buffer_size, len(img_list), args.height, args.width), dtype='f4')
     depths = h5f.create_dataset("depths", (len(img_list), args.height,  args.width), dtype='f4')
@@ -204,22 +202,16 @@ def get_nn_predictions(img_list, grav, num_classes, h5f, args):
     intrinsics_predicted = h5f.create_dataset("intrinsics", (len(img_list), 6), dtype='f4')
     poses = {}
 
-    semseg_buffer = torch.zeros((3, num_classes, args.height, args.width), requires_grad=False).to(device)
-    wtens = torch.tensor([1.0, 2.0, 1.0], requires_grad=False).to(device).unsqueeze(1).unsqueeze(1).unsqueeze(1)
-    with torch.no_grad():
-        semseg_logits = []
-        for i in range(buffer_size-1):
-            semseg_logits.append(segmentation.model.predict(segmentation_model, images[i], num_classes, args.height, args.width))
+    # --- Batched segmentation pre-pass ---
+    # Runs all frames through SegFormer in batches (much faster than one-by-one),
+    # then frees the segmentation model so the SfM loop has full GPU memory.
+    segmentation.model.compute_segmentation_batched(
+        img_list, segmentation_model, seg_preprocessor,
+        semantic_segmentation, args.height, args.width, args.seg_batch_size,
+    )
+    del segmentation_model, seg_preprocessor
+    torch.cuda.empty_cache()
 
-        
-        for i in range(buffer_size-2):
-            semantic_segmentation[i] = torch.stack(semseg_logits[max(0,i-1):i+1]).mean(dim=0).argmax(dim=0).cpu().numpy()
-        
-        if len(semseg_logits)==1:
-            semseg_logits.append(semseg_logits[-1])
-        semseg_buffer[0] = semseg_logits[-2]
-        semseg_buffer[1] = semseg_logits[-1]
-        del semseg_logits
     images = [F.resize(x, (args.height, args.width)) for x in images]
     depth_features = [[f.detach() for f in sfm_model.extract_features(x)] for x in images]
     
@@ -228,11 +220,6 @@ def get_nn_predictions(img_list, grav, num_classes, h5f, args):
         new_im = normalize(totensor(Image.open(img_list[end_index]))).to(device).unsqueeze(0)
 
         
-        with torch.no_grad():
-            semseg_buffer[2] = segmentation.model.predict(segmentation_model, new_im, num_classes, args.height, args.width)
-            semantic_segmentation[end_index-1] = (semseg_buffer*wtens).mean(dim=0).argmax(dim=0).cpu().numpy()
-            semseg_buffer[:2] = semseg_buffer[1:].clone()
-
         images.append(F.resize(new_im, (args.height,  args.width)))
 
         with torch.no_grad():
@@ -265,10 +252,6 @@ def get_nn_predictions(img_list, grav, num_classes, h5f, args):
     for i in tqdm(range(len(img_list))):
         intrinsics_predicted[i] = np.median(intrinsics_predicted_buffered[:counts[i],i],axis=0)
         
-    l = len(img_list)
-
-    semantic_segmentation[-1] = (semseg_buffer * wtens).mean(dim=0).argmax(dim=0).cpu().numpy()
-    
     poses = [(torch.tensor(np.median(poses[i+1][i],axis=0) - np.median(poses[i][i+1],axis=0))/2) for i in range(len(poses)-1)]
     poses = [pose_vec2mat(p).squeeze().cpu().numpy() for p in poses]
     poses = [np.vstack([p, np.array([0, 0, 0, 1]).reshape(1, 4)]) for p in poses]
@@ -416,7 +399,12 @@ def tsdf_point_cloud(img_list, depths, masks, poses, intrinsics, cutoff, frames_
 
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             color, depth, depth_trunc=dist_cutoffs[i], convert_rgb_to_intensity=False, depth_scale=1)
-        
+
+        try:
+            pose_inv = np.linalg.inv(poses[i])
+        except np.linalg.LinAlgError:
+            continue
+
         volume.integrate(
             rgbd,
             o3d.camera.PinholeCameraIntrinsic(
@@ -427,10 +415,10 @@ def tsdf_point_cloud(img_list, depths, masks, poses, intrinsics, cutoff, frames_
             cx=intrinsics[i][2],
             cy=intrinsics[i][3],
         ),
-            np.linalg.inv(poses[i]))
+            pose_inv)
         if (i % frames_per_volume) == (frames_per_volume - tsdf_overlap):
             volume2 = o3d.pipelines.integration.ScalableTSDFVolume(
-                voxel_length=0.3 / 512.0, 
+                voxel_length=0.3 / 512.0,
                 sdf_trunc=0.015,
                 color_type=o3d.pipelines.integration.TSDFVolumeColorType.RGB8
             )
@@ -446,7 +434,7 @@ def tsdf_point_cloud(img_list, depths, masks, poses, intrinsics, cutoff, frames_
                 cx=intrinsics[i][2],
                 cy=intrinsics[i][3],
             ),
-            np.linalg.inv(poses[i]))
+            pose_inv)
         if (i % frames_per_volume) == frames_per_volume - 1:
             pc = volume.extract_point_cloud()
             pc = volume.extract_point_cloud()

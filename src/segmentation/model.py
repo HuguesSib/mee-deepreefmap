@@ -1,5 +1,4 @@
 import segmentation_models_pytorch as smp
-import torch.nn as nn 
 import torch
 import numpy as np
 import torchvision
@@ -8,11 +7,21 @@ import segmentation.utils as utils
 import wandb
 from time import time
 import torchvision.transforms.functional as F
-import torchvision.transforms as transforms
+from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
+from tqdm import tqdm
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-SegmentationModel = lambda classes: smp.DeepLabV3Plus(encoder_name="resnext50_32x4d", classes=classes)
+# Legacy model used for training only
+def SegmentationModel(classes):
+    return smp.DeepLabV3Plus(encoder_name="resnext50_32x4d", classes=classes)
+
+
+def load_segmentation_model(model_name_or_path):
+    """Load a SegFormer segmentation model and its preprocessor from a HuggingFace hub ID or local path."""
+    preprocessor = SegformerImageProcessor.from_pretrained(model_name_or_path)
+    model = SegformerForSemanticSegmentation.from_pretrained(model_name_or_path)
+    return model, preprocessor
 
 class SegmentationDataset(torch.utils.data.Dataset):
     def __init__(self, image_files, label_files, output_size, imagenet_normalization=False):
@@ -154,6 +163,52 @@ class BaselineExperiment:
         return prediction.numpy()
 
 
-def predict(model, image, num_classes, h, w):
-    prediction = model(image)
-    return F.resize(prediction, (h, w),interpolation=torchvision.transforms.InterpolationMode.BILINEAR).squeeze().cpu()
+def predict(model, preprocessor, pil_image, h, w):
+    """Run inference with a SegFormer model. Returns logits tensor of shape (num_classes, h, w)."""
+    model_device = next(model.parameters()).device
+    inputs = preprocessor(pil_image, return_tensors="pt")
+    inputs = {k: v.to(model_device) for k, v in inputs.items()}
+    outputs = model(**inputs)
+    # outputs.logits: (1, num_classes, H/4, W/4) -> resize to (num_classes, h, w)
+    logits = F.resize(outputs.logits.squeeze(0), (h, w),
+                      interpolation=torchvision.transforms.InterpolationMode.BILINEAR)
+    return logits.cpu()
+
+
+def compute_segmentation_batched(img_paths, model, preprocessor, output_dataset, h, w, batch_size=8):
+    """Batched segmentation pre-pass with 3-frame temporal smoothing.
+
+    Processes all frames through the SegFormer in batches of `batch_size` and writes
+    per-frame argmax labels into `output_dataset` (h5py dataset or numpy array).
+
+    Temporal smoothing: each frame i is computed as
+        argmax((logits[i-1] + 2*logits[i] + logits[i+1]) / 4)
+    with boundary padding (first/last frame duplicate themselves).
+    """
+    N = len(img_paths)
+    model_device = next(model.parameters()).device
+
+    # Pad boundaries so every real frame has a left and right neighbour
+    padded = [img_paths[0]] + img_paths + [img_paths[-1]]  # length N+2
+
+    logit_buf = []   # rolling buffer of (C, h, w) CPU tensors
+    out_idx = 0
+
+    for batch_start in tqdm(range(0, N + 2, batch_size), desc="Segmentation"):
+        batch_end = min(batch_start + batch_size, N + 2)
+        imgs = [Image.open(padded[i]) for i in range(batch_start, batch_end)]
+
+        inputs = preprocessor(imgs, return_tensors="pt")
+        inputs = {k: v.to(model_device) for k, v in inputs.items()}
+        with torch.no_grad():
+            logits = model(**inputs).logits  # (B, C, H/4, W/4)
+        logits = F.resize(logits, (h, w),
+                          interpolation=torchvision.transforms.InterpolationMode.BILINEAR).cpu()
+
+        for i in range(logits.shape[0]):
+            logit_buf.append(logits[i])
+            if len(logit_buf) >= 3:
+                smoothed = (logit_buf[0] + 2.0 * logit_buf[1] + logit_buf[2]) / 4.0
+                output_dataset[out_idx] = smoothed.argmax(0).numpy().astype(np.uint8)
+                out_idx += 1
+                logit_buf.pop(0)
