@@ -175,5 +175,7 @@ gpmfstream/
 
 /output/
 /notebooks/
-/work/
+/data/
+*.csv
+*.xlsx
 process_transects.log
